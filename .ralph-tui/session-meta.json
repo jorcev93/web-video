@@ -1,0 +1,14 @@
+{
+  "id": "5c72a492-da4b-40a5-829e-4ef5545173ad",
+  "status": "running",
+  "startedAt": "2026-02-23T06:22:17.633Z",
+  "updatedAt": "2026-02-23T06:22:17.633Z",
+  "agentPlugin": "claude",
+  "trackerPlugin": "beads",
+  "epicId": "web-video-l39",
+  "currentIteration": 0,
+  "maxIterations": 10,
+  "totalTasks": 0,
+  "tasksCompleted": 0,
+  "cwd": "/home/jorgecevallos/Documents/web-video"
+}

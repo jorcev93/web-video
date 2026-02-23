@@ -1,0 +1,6 @@
+defaultAgent = "claude"
+defaultTracker = "beads"
+maxIterations = 10
+iterationDelay = 1000
+outputDir = ".ralph-output"
+configVersion = "2.1"
