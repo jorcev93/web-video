@@ -1,26 +1,31 @@
 import { NextRequest, NextResponse } from "next/server";
 
-export async function POST(req: NextRequest) {
-  const { serverUrl, token } = await req.json();
+const BASE = process.env.MATTERMOST_SERVER_URL?.replace(/\/$/, "");
 
-  if (!serverUrl || !token) {
-    return NextResponse.json({ error: "serverUrl and token are required" }, { status: 400 });
+export async function POST(req: NextRequest) {
+  if (!BASE) {
+    return NextResponse.json({ error: "Servidor no configurado" }, { status: 500 });
   }
 
-  const base = serverUrl.replace(/\/$/, "");
+  const { token } = await req.json();
+
+  if (!token) {
+    return NextResponse.json({ error: "token is required" }, { status: 400 });
+  }
+
   const headers = { Authorization: `Bearer ${token}`, "Content-Type": "application/json" };
 
   try {
-    const teamsRes = await fetch(`${base}/api/v4/users/me/teams`, { headers });
+    const teamsRes = await fetch(`${BASE}/api/v4/users/me/teams`, { headers });
     if (!teamsRes.ok) {
-      return NextResponse.json({ error: "Invalid credentials or server URL" }, { status: 401 });
+      return NextResponse.json({ error: "Sesión inválida o expirada" }, { status: 401 });
     }
     const teams: { id: string; display_name: string }[] = await teamsRes.json();
 
     const teamsWithChannels = await Promise.all(
       teams.map(async (team) => {
         const chRes = await fetch(
-          `${base}/api/v4/users/me/teams/${team.id}/channels`,
+          `${BASE}/api/v4/users/me/teams/${team.id}/channels`,
           { headers }
         );
         const channels: { id: string; name: string; display_name: string; type: string }[] =
