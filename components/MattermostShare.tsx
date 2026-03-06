@@ -37,7 +37,9 @@ interface Props {
 
 export default function MattermostShare({ blob, onClose }: Props) {
   const [step, setStep] = useState<Step>("config");
-  const [serverUrl, setServerUrl] = useState("");
+  const serverUrl = "";
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
   const [token, setToken] = useState("");
   const [configError, setConfigError] = useState("");
   const [connecting, setConnecting] = useState(false);
@@ -53,14 +55,13 @@ export default function MattermostShare({ blob, onClose }: Props) {
   const [message, setMessage] = useState("");
   const [errorMessage, setErrorMessage] = useState("");
 
-  // Load saved credentials on mount
+  // Load saved token on mount
   useEffect(() => {
     try {
       const saved = localStorage.getItem(STORAGE_KEY);
       if (saved) {
         const { serverUrl: su, token: t } = JSON.parse(saved);
         if (su && t) {
-          setServerUrl(su);
           setToken(t);
         }
       }
@@ -69,7 +70,7 @@ export default function MattermostShare({ blob, onClose }: Props) {
     }
   }, []);
 
-  const loadData = useCallback(async (su: string, t: string) => {
+  const loadData = useCallback(async (_su: string, t: string) => {
     setConnecting(true);
     setConfigError("");
     try {
@@ -77,12 +78,12 @@ export default function MattermostShare({ blob, onClose }: Props) {
         fetch("/api/mattermost/channels", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ serverUrl: su, token: t }),
+          body: JSON.stringify({ token: t }),
         }),
         fetch("/api/mattermost/users", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ serverUrl: su, token: t }),
+          body: JSON.stringify({ token: t }),
         }),
       ]);
 
@@ -102,7 +103,7 @@ export default function MattermostShare({ blob, onClose }: Props) {
         setGroups(g);
       }
 
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({ serverUrl: su, token: t }));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ token: t }));
       setStep("browse");
     } catch {
       setConfigError("No se pudo conectar al servidor");
@@ -130,16 +131,38 @@ export default function MattermostShare({ blob, onClose }: Props) {
 
   const handleConnect = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!serverUrl.trim() || !token.trim()) {
-      setConfigError("Ingresa el servidor y el token");
+    if (!username.trim() || !password.trim()) {
+      setConfigError("Ingresa tu usuario y contraseña");
       return;
     }
-    await loadData(serverUrl.trim(), token.trim());
+    setConnecting(true);
+    setConfigError("");
+    try {
+      const res = await fetch("/api/mattermost/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username: username.trim(), password }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setConfigError(data.error ?? "Error al iniciar sesión");
+        return;
+      }
+      setToken(data.token);
+      await loadData(serverUrl.trim(), data.token);
+    } catch {
+      setConfigError("No se pudo conectar al servidor");
+    } finally {
+      setConnecting(false);
+    }
   };
 
   const handleDisconnect = () => {
     localStorage.removeItem(STORAGE_KEY);
     setStep("config");
+    setToken("");
+    setUsername("");
+    setPassword("");
     setTeams([]);
     setUsers([]);
     setGroups([]);
@@ -151,7 +174,6 @@ export default function MattermostShare({ blob, onClose }: Props) {
     setStep("sending");
 
     const fd = new FormData();
-    fd.append("serverUrl", serverUrl);
     fd.append("token", token);
     fd.append("channelId", selectedId);
     fd.append("recipientType", selectedType);
@@ -226,26 +248,28 @@ export default function MattermostShare({ blob, onClose }: Props) {
           {step === "config" && (
             <form onSubmit={handleConnect} className="flex flex-col gap-4">
               <p className="text-sm text-text-secondary">
-                Ingresa las credenciales de tu servidor Mattermost. Se guardarán localmente.
+                Inicia sesión en Mattermost. La sesión se guardará localmente.
               </p>
               <div className="flex flex-col gap-1.5">
-                <label className="text-xs font-medium text-text-secondary">URL del servidor</label>
+                <label className="text-xs font-medium text-text-secondary">Usuario</label>
                 <input
-                  type="url"
-                  placeholder="https://mattermost.ejemplo.com"
-                  value={serverUrl}
-                  onChange={(e) => setServerUrl(e.target.value)}
+                  type="text"
+                  placeholder="tu.usuario"
+                  value={username}
+                  onChange={(e) => setUsername(e.target.value)}
+                  autoComplete="username"
                   className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm text-text-primary placeholder:text-text-muted focus:border-accent-light focus:outline-none"
                   required
                 />
               </div>
               <div className="flex flex-col gap-1.5">
-                <label className="text-xs font-medium text-text-secondary">Personal Access Token</label>
+                <label className="text-xs font-medium text-text-secondary">Contraseña</label>
                 <input
                   type="password"
                   placeholder="••••••••••••••••"
-                  value={token}
-                  onChange={(e) => setToken(e.target.value)}
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  autoComplete="current-password"
                   className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm text-text-primary placeholder:text-text-muted focus:border-accent-light focus:outline-none"
                   required
                 />
@@ -258,7 +282,7 @@ export default function MattermostShare({ blob, onClose }: Props) {
                 disabled={connecting}
                 className="rounded-lg bg-accent px-6 py-2.5 font-medium text-white transition-colors hover:bg-accent-hover disabled:opacity-60"
               >
-                {connecting ? "Conectando…" : "Conectar"}
+                {connecting ? "Iniciando sesión…" : "Iniciar sesión"}
               </button>
             </form>
           )}

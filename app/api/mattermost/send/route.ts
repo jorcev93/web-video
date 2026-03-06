@@ -1,35 +1,36 @@
 import { NextRequest, NextResponse } from "next/server";
 
+const BASE = process.env.MATTERMOST_SERVER_URL?.replace(/\/$/, "");
+
 export async function POST(req: NextRequest) {
+  if (!BASE) {
+    return NextResponse.json({ error: "Servidor no configurado" }, { status: 500 });
+  }
+
   const formData = await req.formData();
-  const serverUrl = formData.get("serverUrl") as string;
   const token = formData.get("token") as string;
   const recipientId = formData.get("channelId") as string;
   const recipientType = (formData.get("recipientType") as string) ?? "channel";
   const message = (formData.get("message") as string) ?? "";
   const file = formData.get("file") as Blob | null;
 
-  if (!serverUrl || !token || !recipientId) {
-    return NextResponse.json(
-      { error: "serverUrl, token, and channelId are required" },
-      { status: 400 }
-    );
+  if (!token || !recipientId) {
+    return NextResponse.json({ error: "token and channelId are required" }, { status: 400 });
   }
 
-  const base = serverUrl.replace(/\/$/, "");
   const authHeaders = { Authorization: `Bearer ${token}` };
 
   try {
-    // Resolve the real channel ID for DMs (user IDs need a DM channel)
+    // Resolve the real channel ID for DMs
     let channelId = recipientId;
     if (recipientType === "user") {
-      const meRes = await fetch(`${base}/api/v4/users/me`, { headers: authHeaders });
+      const meRes = await fetch(`${BASE}/api/v4/users/me`, { headers: authHeaders });
       if (!meRes.ok) {
-        return NextResponse.json({ error: "Invalid token" }, { status: 401 });
+        return NextResponse.json({ error: "Sesión inválida o expirada" }, { status: 401 });
       }
       const me: { id: string } = await meRes.json();
 
-      const dmRes = await fetch(`${base}/api/v4/channels/direct`, {
+      const dmRes = await fetch(`${BASE}/api/v4/channels/direct`, {
         method: "POST",
         headers: { ...authHeaders, "Content-Type": "application/json" },
         body: JSON.stringify([me.id, recipientId]),
@@ -48,12 +49,11 @@ export async function POST(req: NextRequest) {
     let fileIds: string[] = [];
 
     if (file) {
-      // Upload file
       const uploadForm = new FormData();
       uploadForm.append("channel_id", channelId);
       uploadForm.append("files", file, "grabacion.webm");
 
-      const uploadRes = await fetch(`${base}/api/v4/files`, {
+      const uploadRes = await fetch(`${BASE}/api/v4/files`, {
         method: "POST",
         headers: authHeaders,
         body: uploadForm,
@@ -71,8 +71,7 @@ export async function POST(req: NextRequest) {
       fileIds = uploadData.file_infos.map((f) => f.id);
     }
 
-    // Create post
-    const postRes = await fetch(`${base}/api/v4/posts`, {
+    const postRes = await fetch(`${BASE}/api/v4/posts`, {
       method: "POST",
       headers: { ...authHeaders, "Content-Type": "application/json" },
       body: JSON.stringify({ channel_id: channelId, message, file_ids: fileIds }),
