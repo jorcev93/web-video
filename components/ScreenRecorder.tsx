@@ -2,6 +2,7 @@
 
 import { useState, useRef, useCallback, useEffect } from "react";
 import { type SelectedFile } from "@/components/VideoUpload";
+import MattermostShare from "@/components/MattermostShare";
 
 type RecorderState = "idle" | "requesting" | "recording" | "preview";
 
@@ -21,6 +22,7 @@ export default function ScreenRecorder({ onSendToCompressor, onRecordingChange }
   const [error, setError] = useState<string | null>(null);
   const [duration, setDuration] = useState(0);
   const [blobSize, setBlobSize] = useState(0);
+  const [showMattermost, setShowMattermost] = useState(false);
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
@@ -279,12 +281,26 @@ export default function ScreenRecorder({ onSendToCompressor, onRecordingChange }
           )}
           <button
             type="button"
+            onClick={() => setShowMattermost(true)}
+            className="w-full rounded-lg border border-border px-6 py-2.5 text-sm font-medium text-text-secondary transition-colors hover:bg-surface-hover"
+          >
+            Enviar por Mattermost
+          </button>
+          <button
+            type="button"
             onClick={handleReset}
             className="w-full rounded-lg border border-border px-6 py-2.5 text-sm font-medium text-text-secondary transition-colors hover:bg-surface-hover"
           >
             Volver a grabar
           </button>
         </div>
+      )}
+
+      {showMattermost && blobRef.current && (
+        <MattermostShare
+          blob={blobRef.current}
+          onClose={() => setShowMattermost(false)}
+        />
       )}
     </div>
   );
