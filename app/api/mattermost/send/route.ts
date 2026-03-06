@@ -1,0 +1,93 @@
+import { NextRequest, NextResponse } from "next/server";
+
+export async function POST(req: NextRequest) {
+  const formData = await req.formData();
+  const serverUrl = formData.get("serverUrl") as string;
+  const token = formData.get("token") as string;
+  const recipientId = formData.get("channelId") as string;
+  const recipientType = (formData.get("recipientType") as string) ?? "channel";
+  const message = (formData.get("message") as string) ?? "";
+  const file = formData.get("file") as Blob | null;
+
+  if (!serverUrl || !token || !recipientId) {
+    return NextResponse.json(
+      { error: "serverUrl, token, and channelId are required" },
+      { status: 400 }
+    );
+  }
+
+  const base = serverUrl.replace(/\/$/, "");
+  const authHeaders = { Authorization: `Bearer ${token}` };
+
+  try {
+    // Resolve the real channel ID for DMs (user IDs need a DM channel)
+    let channelId = recipientId;
+    if (recipientType === "user") {
+      const meRes = await fetch(`${base}/api/v4/users/me`, { headers: authHeaders });
+      if (!meRes.ok) {
+        return NextResponse.json({ error: "Invalid token" }, { status: 401 });
+      }
+      const me: { id: string } = await meRes.json();
+
+      const dmRes = await fetch(`${base}/api/v4/channels/direct`, {
+        method: "POST",
+        headers: { ...authHeaders, "Content-Type": "application/json" },
+        body: JSON.stringify([me.id, recipientId]),
+      });
+      if (!dmRes.ok) {
+        const text = await dmRes.text();
+        return NextResponse.json(
+          { error: `Failed to create DM channel: ${text}` },
+          { status: dmRes.status }
+        );
+      }
+      const dmChannel: { id: string } = await dmRes.json();
+      channelId = dmChannel.id;
+    }
+
+    let fileIds: string[] = [];
+
+    if (file) {
+      // Upload file
+      const uploadForm = new FormData();
+      uploadForm.append("channel_id", channelId);
+      uploadForm.append("files", file, "grabacion.webm");
+
+      const uploadRes = await fetch(`${base}/api/v4/files`, {
+        method: "POST",
+        headers: authHeaders,
+        body: uploadForm,
+      });
+
+      if (!uploadRes.ok) {
+        const text = await uploadRes.text();
+        return NextResponse.json(
+          { error: `File upload failed: ${text}` },
+          { status: uploadRes.status }
+        );
+      }
+
+      const uploadData: { file_infos: { id: string }[] } = await uploadRes.json();
+      fileIds = uploadData.file_infos.map((f) => f.id);
+    }
+
+    // Create post
+    const postRes = await fetch(`${base}/api/v4/posts`, {
+      method: "POST",
+      headers: { ...authHeaders, "Content-Type": "application/json" },
+      body: JSON.stringify({ channel_id: channelId, message, file_ids: fileIds }),
+    });
+
+    if (!postRes.ok) {
+      const text = await postRes.text();
+      return NextResponse.json(
+        { error: `Post creation failed: ${text}` },
+        { status: postRes.status }
+      );
+    }
+
+    return NextResponse.json({ ok: true });
+  } catch {
+    return NextResponse.json({ error: "Failed to reach Mattermost server" }, { status: 502 });
+  }
+}

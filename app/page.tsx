@@ -1,6 +1,6 @@
 import Hero from "@/components/Hero";
 import Features from "@/components/Features";
-import CompressorSection from "@/components/CompressorSection";
+import ToolSection from "@/components/ToolSection";
 import FAQ from "@/components/FAQ";
 import Footer from "@/components/Footer";
 
@@ -10,7 +10,7 @@ export default function Home() {
       <main>
         <Hero />
         <Features />
-        <CompressorSection />
+        <ToolSection />
         <FAQ />
       </main>
       <Footer />

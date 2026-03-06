@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback, useRef } from "react";
+import { useState, useCallback, useRef, useEffect } from "react";
 import VideoUpload, { type SelectedFile } from "@/components/VideoUpload";
 import { FFmpeg } from "@ffmpeg/ffmpeg";
 import { fetchFile, toBlobURL } from "@ffmpeg/util";
@@ -23,22 +23,44 @@ function getVideoDuration(file: File): Promise<number> {
     const video = document.createElement("video");
     video.preload = "metadata";
     video.onloadedmetadata = () => {
-      URL.revokeObjectURL(video.src);
-      resolve(video.duration);
+      if (isFinite(video.duration)) {
+        URL.revokeObjectURL(video.src);
+        resolve(video.duration);
+      } else {
+        // WebM grabado con MediaRecorder no incluye duración en el header.
+        // Forzar seek al final para que el navegador la calcule.
+        video.onseeked = () => {
+          URL.revokeObjectURL(video.src);
+          resolve(video.duration);
+        };
+        video.currentTime = Number.MAX_SAFE_INTEGER;
+      }
     };
     video.onerror = () => reject(new Error("No se pudo leer la duración del video"));
     video.src = URL.createObjectURL(file);
   });
 }
 
-export default function CompressorSection() {
+interface Props {
+  initialFile?: SelectedFile | null;
+  onReset?: () => void;
+}
+
+export default function CompressorSection({ initialFile, onReset }: Props = {}) {
   const [selectedFile, setSelectedFile] = useState<SelectedFile | null>(null);
   const [targetSizeMB, setTargetSizeMB] = useState("");
   const [state, setState] = useState<CompressionState>("idle");
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<CompressionResult | null>(null);
   const [compressionMethod, setCompressionMethod] = useState<CompressionMethod>("api");
+  const [progress, setProgress] = useState(0);
   const ffmpegRef = useRef<FFmpeg | null>(null);
+
+  useEffect(() => {
+    if (initialFile) {
+      setSelectedFile(initialFile);
+    }
+  }, [initialFile]);
 
   const originalSizeMB = selectedFile ? selectedFile.size / (1024 * 1024) : 0;
 
@@ -68,10 +90,11 @@ export default function CompressorSection() {
     setState(needsLoading ? "loading-ffmpeg" : "compressing");
     setError(null);
     setResult(null);
+    setProgress(0);
 
     try {
       if (compressionMethod === "api") {
-        // --- Compresión vía API del servidor ---
+        // --- Compresión vía API del servidor (SSE) ---
         const formData = new FormData();
         formData.append("file", selectedFile.file);
         formData.append("targetSizeMB", targetSizeMB);
@@ -81,15 +104,50 @@ export default function CompressorSection() {
           body: formData,
         });
 
-        if (!response.ok) {
-          const data = await response.json();
-          throw new Error(data.error || "Error en la compresión");
+        if (!response.body) throw new Error("Error en la conexión con el servidor");
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let jobId: string | null = null;
+        let compressedSizeMB: string | null = null;
+
+        outer: while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() ?? "";
+
+          for (const line of lines) {
+            if (!line.startsWith("data: ")) continue;
+            const event = JSON.parse(line.slice(6));
+
+            if (event.type === "progress") {
+              setProgress(event.percent);
+            } else if (event.type === "done") {
+              jobId = event.jobId;
+              compressedSizeMB = event.compressedSizeMB;
+              setProgress(100);
+              break outer;
+            } else if (event.type === "error") {
+              throw new Error(event.message);
+            }
+          }
         }
 
-        const blob = await response.blob();
-        const compressedSizeMB =
-          response.headers.get("X-Compressed-Size") || formatMB(blob.size);
+        if (!jobId || !compressedSizeMB) {
+          throw new Error("La compresión no se completó correctamente");
+        }
 
+        const downloadResponse = await fetch(`/api/compress/download?jobId=${jobId}`);
+        if (!downloadResponse.ok) {
+          const data = await downloadResponse.json();
+          throw new Error(data.error || "Error al descargar el archivo comprimido");
+        }
+
+        const blob = await downloadResponse.blob();
         const baseName = selectedFile.name.replace(/\.[^.]+$/, "");
         const fileName = `${baseName}_compressed_${compressedSizeMB}mb.mp4`;
 
@@ -99,10 +157,11 @@ export default function CompressorSection() {
         // --- Compresión local en el dispositivo (ffmpeg.wasm) ---
         if (!ffmpegRef.current) {
           const ffmpeg = new FFmpeg();
-          const baseURL = "https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd";
+          const baseURL = "https://unpkg.com/@ffmpeg/core-mt@0.12.6/dist/umd";
           await ffmpeg.load({
             coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, "text/javascript"),
             wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, "application/wasm"),
+            workerURL: await toBlobURL(`${baseURL}/ffmpeg-core.worker.js`, "text/javascript"),
           });
           ffmpegRef.current = ffmpeg;
           setState("compressing");
@@ -110,15 +169,18 @@ export default function CompressorSection() {
 
         const ffmpeg = ffmpegRef.current;
 
-        // Obtener duración del video desde el navegador
+        ffmpeg.on("progress", ({ time }) => {
+          // time = microsegundos procesados; más confiable que "progress" para WebM sin duración en metadatos
+          const p = duration > 0 ? Math.min(time / (duration * 1_000_000), 0.99) : 0;
+          setProgress(Math.round(p * 100));
+        });
+
         const duration = await getVideoDuration(selectedFile.file);
 
-        // Calcular bitrates (misma lógica que el servidor)
-        const audioBitrate = 128; // kbps
+        const audioBitrate = 0; // grabaciones de pantalla sin audio
         const targetMB = parseFloat(targetSizeMB);
-        const audioBitsTotal = audioBitrate * 1000 * duration;
         const targetBitsTotal = targetMB * 1024 * 1024 * 8;
-        const videoBitsTotal = targetBitsTotal - audioBitsTotal;
+        const videoBitsTotal = targetBitsTotal;
 
         if (videoBitsTotal <= 0) {
           throw new Error("El tamaño objetivo es demasiado pequeño para este video");
@@ -130,21 +192,22 @@ export default function CompressorSection() {
           throw new Error("El tamaño objetivo resultaría en una calidad de video inaceptable");
         }
 
-        // Escribir archivo en el sistema de archivos virtual de ffmpeg
         const ext = selectedFile.name.split(".").pop()?.toLowerCase() || "mp4";
         const inputName = `input.${ext}`;
         await ffmpeg.writeFile(inputName, await fetchFile(selectedFile.file));
 
-        // Ejecutar compresión
         await ffmpeg.exec([
+          "-threads", "0",
           "-i", inputName,
           "-b:v", `${videoBitrate}k`,
-          "-b:a", `${audioBitrate}k`,
+          "-an",
+          "-preset", "ultrafast",
           "-movflags", "+faststart",
           "output.mp4",
         ]);
 
-        // Leer resultado
+        setProgress(100);
+
         const rawData = await ffmpeg.readFile("output.mp4");
         const blobData: ArrayBuffer = rawData instanceof Uint8Array
           ? new Uint8Array(rawData).buffer.slice(0) as ArrayBuffer
@@ -152,9 +215,10 @@ export default function CompressorSection() {
         const blob = new Blob([blobData], { type: "video/mp4" });
         const compressedSizeMB = formatMB(blob.size);
 
-        // Limpiar sistema de archivos virtual
         await ffmpeg.deleteFile(inputName).catch(() => {});
         await ffmpeg.deleteFile("output.mp4").catch(() => {});
+
+        ffmpeg.off("progress", () => {});
 
         const baseName = selectedFile.name.replace(/\.[^.]+$/, "");
         const fileName = `${baseName}_compressed_${compressedSizeMB}mb.mp4`;
@@ -175,7 +239,9 @@ export default function CompressorSection() {
     setState("idle");
     setError(null);
     setResult(null);
-  }, []);
+    setProgress(0);
+    onReset?.();
+  }, [onReset]);
 
   const handleDownload = useCallback(() => {
     if (!result) return;
@@ -190,14 +256,7 @@ export default function CompressorSection() {
   }, [result]);
 
   return (
-    <section id="compresor" className="mx-auto max-w-2xl px-4 py-20">
-      <h2 className="mb-2 text-center text-2xl font-bold text-text-primary sm:text-3xl">
-        Sube tu video
-      </h2>
-      <p className="mb-8 text-center text-text-secondary">
-        Selecciona el video que quieres comprimir
-      </p>
-
+    <div className="w-full">
       <VideoUpload
         onFileSelected={setSelectedFile}
         disabled={isProcessing}
@@ -221,21 +280,10 @@ export default function CompressorSection() {
                     : "border-border bg-surface text-text-secondary hover:bg-surface-hover"
                   }`}
               >
-                {/* Ícono nube/servidor */}
-                <svg
-                  className="h-4 w-4"
-                  fill="none"
-                  viewBox="0 0 24 24"
-                  stroke="currentColor"
-                  strokeWidth={1.5}
-                >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    d="M2.25 15a4.5 4.5 0 0 0 4.5 4.5H18a3.75 3.75 0 0 0 1.332-7.257 3 3 0 0 0-3.758-3.848 5.25 5.25 0 0 0-10.233 2.33A4.502 4.502 0 0 0 2.25 15Z"
-                  />
+                <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M2.25 15a4.5 4.5 0 0 0 4.5 4.5H18a3.75 3.75 0 0 0 1.332-7.257 3 3 0 0 0-3.758-3.848 5.25 5.25 0 0 0-10.233 2.33A4.502 4.502 0 0 0 2.25 15Z" />
                 </svg>
-                API del servidor
+                Rápido (recomendado)
               </button>
 
               <button
@@ -248,27 +296,16 @@ export default function CompressorSection() {
                     : "border-border bg-surface text-text-secondary hover:bg-surface-hover"
                   }`}
               >
-                {/* Ícono CPU/dispositivo */}
-                <svg
-                  className="h-4 w-4"
-                  fill="none"
-                  viewBox="0 0 24 24"
-                  stroke="currentColor"
-                  strokeWidth={1.5}
-                >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    d="M8.25 3v1.5M4.5 8.25H3m18 0h-1.5M4.5 12H3m18 0h-1.5m-15 3.75H3m18 0h-1.5M8.25 19.5V21M12 3v1.5m0 15V21m3.75-18v1.5m0 15V21m-9-1.5h10.5a2.25 2.25 0 0 0 2.25-2.25V6.75a2.25 2.25 0 0 0-2.25-2.25H6.75A2.25 2.25 0 0 0 4.5 6.75v10.5a2.25 2.25 0 0 0 2.25 2.25Zm.75-12h9v9h-9v-9Z"
-                  />
+                <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M8.25 3v1.5M4.5 8.25H3m18 0h-1.5M4.5 12H3m18 0h-1.5m-15 3.75H3m18 0h-1.5M8.25 19.5V21M12 3v1.5m0 15V21m3.75-18v1.5m0 15V21m-9-1.5h10.5a2.25 2.25 0 0 0 2.25-2.25V6.75a2.25 2.25 0 0 0-2.25-2.25H6.75A2.25 2.25 0 0 0 4.5 6.75v10.5a2.25 2.25 0 0 0 2.25 2.25Zm.75-12h9v9h-9v-9Z" />
                 </svg>
-                Este dispositivo
+                En el navegador
               </button>
             </div>
             <p className="mt-2 text-xs text-text-muted">
               {compressionMethod === "api"
-                ? "Más rápido. El video se envía al servidor para procesarse."
-                : "Sin subir archivos. La compresión ocurre en tu navegador."}
+                ? "Usa ffmpeg nativo. Más rápido, ideal para archivos grandes."
+                : "Todo ocurre en el navegador. Más lento, mejor para archivos pequeños."}
             </p>
           </div>
 
@@ -311,24 +348,9 @@ export default function CompressorSection() {
           >
             {isProcessing ? (
               <span className="flex items-center justify-center gap-3">
-                <svg
-                  className="h-5 w-5 animate-spin"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                >
-                  <circle
-                    className="opacity-25"
-                    cx="12"
-                    cy="12"
-                    r="10"
-                    stroke="currentColor"
-                    strokeWidth="4"
-                  />
-                  <path
-                    className="opacity-75"
-                    fill="currentColor"
-                    d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
-                  />
+                <svg className="h-5 w-5 animate-spin" viewBox="0 0 24 24" fill="none">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
                 </svg>
                 {state === "loading-ffmpeg" ? "Cargando motor..." : "Comprimiendo..."}
               </span>
@@ -339,21 +361,37 @@ export default function CompressorSection() {
         </div>
       )}
 
-      {/* Estado de procesamiento */}
+      {/* Estado de procesamiento con progreso */}
       {isProcessing && (
         <div className="mt-6 rounded-xl border border-border bg-surface p-6">
-          <div className="flex flex-col items-center gap-3">
-            <div className="h-2 w-full overflow-hidden rounded-full bg-surface-hover">
-              <div
-                className="h-full animate-pulse rounded-full bg-accent-light"
-                style={{ width: "100%" }}
-              />
+          <div className="flex flex-col gap-3">
+            <div className="flex items-center justify-between text-sm">
+              <span className="text-text-secondary">
+                {state === "loading-ffmpeg"
+                  ? "Cargando motor de compresión..."
+                  : "Comprimiendo video..."}
+              </span>
+              {state === "compressing" && (
+                <span className="font-semibold tabular-nums text-accent-light">
+                  {progress}%
+                </span>
+              )}
             </div>
-            <p className="text-sm text-text-secondary">
-              {state === "loading-ffmpeg"
-                ? "Cargando motor de compresión en tu navegador... Un momento."
-                : `Comprimiendo video a ${targetSizeMB} MB... Esto puede tomar unos momentos.`}
-            </p>
+            <div className="h-2 w-full overflow-hidden rounded-full bg-surface-hover">
+              {state === "loading-ffmpeg" || progress === 0 ? (
+                <div className="h-full w-full animate-pulse rounded-full bg-accent-light" />
+              ) : (
+                <div
+                  className="h-full rounded-full bg-accent-light transition-all duration-300 ease-out"
+                  style={{ width: `${progress}%` }}
+                />
+              )}
+            </div>
+            {state === "compressing" && progress > 0 && (
+              <p className="text-xs text-text-muted">
+                Objetivo: {targetSizeMB} MB
+              </p>
+            )}
           </div>
         </div>
       )}
@@ -362,32 +400,17 @@ export default function CompressorSection() {
       {state === "error" && error && (
         <div className="mt-6 rounded-xl border border-red-500/30 bg-red-500/10 p-6">
           <div className="flex items-start gap-3">
-            <svg
-              className="mt-0.5 h-5 w-5 shrink-0 text-red-400"
-              fill="none"
-              viewBox="0 0 24 24"
-              stroke="currentColor"
-              strokeWidth={1.5}
-            >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                d="M12 9v3.75m9-.75a9 9 0 1 1-18 0 9 9 0 0 1 18 0Zm-9 3.75h.008v.008H12v-.008Z"
-              />
+            <svg className="mt-0.5 h-5 w-5 shrink-0 text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m9-.75a9 9 0 1 1-18 0 9 9 0 0 1 18 0Zm-9 3.75h.008v.008H12v-.008Z" />
             </svg>
             <div>
-              <p className="text-sm font-medium text-red-400">
-                Error en la compresión
-              </p>
+              <p className="text-sm font-medium text-red-400">Error en la compresión</p>
               <p className="mt-1 text-sm text-red-400/80">{error}</p>
             </div>
           </div>
           <button
             type="button"
-            onClick={() => {
-              setState("idle");
-              setError(null);
-            }}
+            onClick={() => { setState("idle"); setError(null); }}
             className="mt-4 w-full rounded-lg border border-red-500/30 px-4 py-2 text-sm text-red-400 transition-colors hover:bg-red-500/10"
           >
             Intentar de nuevo
@@ -399,18 +422,8 @@ export default function CompressorSection() {
       {state === "done" && result && (
         <div className="mt-6 rounded-xl border border-accent/30 bg-accent/5 p-6">
           <div className="flex flex-col items-center gap-4">
-            <svg
-              className="h-10 w-10 text-accent-light"
-              fill="none"
-              viewBox="0 0 24 24"
-              stroke="currentColor"
-              strokeWidth={1.5}
-            >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                d="M9 12.75 11.25 15 15 9.75M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z"
-              />
+            <svg className="h-10 w-10 text-accent-light" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75 11.25 15 15 9.75M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z" />
             </svg>
             <div className="text-center">
               <p className="text-lg font-medium text-text-primary">
@@ -418,14 +431,9 @@ export default function CompressorSection() {
               </p>
               <p className="mt-1 text-sm text-text-secondary">
                 Tamaño final:{" "}
-                <span className="font-medium text-accent-light">
-                  {result.compressedSizeMB} MB
-                </span>
+                <span className="font-medium text-accent-light">{result.compressedSizeMB} MB</span>
                 {selectedFile && (
-                  <span className="text-text-muted">
-                    {" "}
-                    (de {formatMB(selectedFile.size)} MB)
-                  </span>
+                  <span className="text-text-muted"> (de {formatMB(selectedFile.size)} MB)</span>
                 )}
               </p>
             </div>
@@ -448,6 +456,6 @@ export default function CompressorSection() {
           </div>
         </div>
       )}
-    </section>
+    </div>
   );
 }
