@@ -2,6 +2,7 @@
 
 import { useState, useCallback, useRef, useEffect } from "react";
 import VideoUpload, { type SelectedFile } from "@/components/VideoUpload";
+import MattermostShare from "@/components/MattermostShare";
 import { FFmpeg } from "@ffmpeg/ffmpeg";
 import { fetchFile, toBlobURL } from "@ffmpeg/util";
 
@@ -54,6 +55,7 @@ export default function CompressorSection({ initialFile, onReset }: Props = {}) 
   const [result, setResult] = useState<CompressionResult | null>(null);
   const [compressionMethod, setCompressionMethod] = useState<CompressionMethod>("api");
   const [progress, setProgress] = useState(0);
+  const [showMattermost, setShowMattermost] = useState(false);
   const ffmpegRef = useRef<FFmpeg | null>(null);
 
   useEffect(() => {
@@ -453,8 +455,22 @@ export default function CompressorSection({ initialFile, onReset }: Props = {}) 
                 Comprimir otro
               </button>
             </div>
+            <button
+              type="button"
+              onClick={() => setShowMattermost(true)}
+              className="w-full rounded-lg border border-border px-6 py-2.5 text-sm font-medium text-text-secondary transition-colors hover:bg-surface-hover"
+            >
+              Enviar por Mattermost
+            </button>
           </div>
         </div>
+      )}
+
+      {showMattermost && result && (
+        <MattermostShare
+          blob={result.blob}
+          onClose={() => setShowMattermost(false)}
+        />
       )}
     </div>
   );
