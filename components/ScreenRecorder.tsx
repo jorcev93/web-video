@@ -3,8 +3,10 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 import { type SelectedFile } from "@/components/VideoUpload";
 import MattermostShare from "@/components/MattermostShare";
+import { FFmpeg } from "@ffmpeg/ffmpeg";
+import { fetchFile, toBlobURL } from "@ffmpeg/util";
 
-type RecorderState = "idle" | "requesting" | "recording" | "preview";
+type RecorderState = "idle" | "requesting" | "recording" | "preview" | "converting";
 
 interface Props {
   onSendToCompressor: (file: SelectedFile) => void;
@@ -23,6 +25,7 @@ export default function ScreenRecorder({ onSendToCompressor, onRecordingChange }
   const [duration, setDuration] = useState(0);
   const [blobSize, setBlobSize] = useState(0);
   const [showMattermost, setShowMattermost] = useState(false);
+  const [ffmpegReady, setFfmpegReady] = useState(false);
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
@@ -30,6 +33,30 @@ export default function ScreenRecorder({ onSendToCompressor, onRecordingChange }
   const blobRef = useRef<Blob | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const ffmpegRef = useRef<FFmpeg | null>(null);
+
+  // Pre-cargar FFmpeg en segundo plano al montar el componente
+  useEffect(() => {
+    let cancelled = false;
+    async function loadFFmpeg() {
+      try {
+        const ffmpeg = new FFmpeg();
+        const baseURL = "https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd";
+        await ffmpeg.load({
+          coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, "text/javascript"),
+          wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, "application/wasm"),
+        });
+        if (!cancelled) {
+          ffmpegRef.current = ffmpeg;
+          setFfmpegReady(true);
+        }
+      } catch {
+        // Si falla la precarga, lo intentará al descargar
+      }
+    }
+    loadFFmpeg();
+    return () => { cancelled = true; };
+  }, []);
 
   const stopTimer = useCallback(() => {
     if (timerRef.current) {
@@ -59,7 +86,6 @@ export default function ScreenRecorder({ onSendToCompressor, onRecordingChange }
         : "video/webm";
 
       chunksRef.current = [];
-      // 8 Mbps preserva calidad suficiente para re-comprimir sin degradación visible
       const recorder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: 8_000_000 });
       mediaRecorderRef.current = recorder;
 
@@ -76,7 +102,6 @@ export default function ScreenRecorder({ onSendToCompressor, onRecordingChange }
         setState("preview");
       };
 
-      // Stop recording if user closes the share dialog/tab
       stream.getVideoTracks()[0].addEventListener("ended", () => {
         if (mediaRecorderRef.current?.state === "recording") {
           mediaRecorderRef.current.stop();
@@ -92,7 +117,7 @@ export default function ScreenRecorder({ onSendToCompressor, onRecordingChange }
       stopStream();
       setState("idle");
       if (err instanceof Error && err.name === "NotAllowedError") {
-        // User cancelled — no error shown
+        // Usuario canceló — no mostrar error
       } else {
         setError(
           err instanceof Error
@@ -108,7 +133,55 @@ export default function ScreenRecorder({ onSendToCompressor, onRecordingChange }
     stopStream();
   }, [stopStream]);
 
-  const handleDownload = useCallback(() => {
+  const handleDownloadMP4 = useCallback(async () => {
+    if (!blobRef.current) return;
+    setState("converting");
+    setError(null);
+
+    try {
+      // Si FFmpeg no se pre-cargó, cargarlo ahora
+      if (!ffmpegRef.current) {
+        const ffmpeg = new FFmpeg();
+        const baseURL = "https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd";
+        await ffmpeg.load({
+          coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, "text/javascript"),
+          wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, "application/wasm"),
+        });
+        ffmpegRef.current = ffmpeg;
+      }
+
+      const ffmpeg = ffmpegRef.current;
+      await ffmpeg.writeFile("input.webm", await fetchFile(blobRef.current));
+      await ffmpeg.exec([
+        "-i", "input.webm",
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "28",
+        "-movflags", "+faststart",
+        "output.mp4",
+      ]);
+
+      const rawData = await ffmpeg.readFile("output.mp4");
+      const mp4Blob = new Blob([new Uint8Array(rawData as Uint8Array)], { type: "video/mp4" });
+      await ffmpeg.deleteFile("input.webm").catch(() => {});
+      await ffmpeg.deleteFile("output.mp4").catch(() => {});
+
+      const url = URL.createObjectURL(mp4Blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `grabacion-${new Date().toISOString().slice(0, 19).replace(/:/g, "-")}.mp4`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch {
+      setError("No se pudo convertir el video a MP4");
+    } finally {
+      setState("preview");
+    }
+  }, []);
+
+  const handleDownloadWebM = useCallback(() => {
     if (!blobRef.current) return;
     const url = URL.createObjectURL(blobRef.current);
     const a = document.createElement("a");
@@ -144,7 +217,7 @@ export default function ScreenRecorder({ onSendToCompressor, onRecordingChange }
     setState("idle");
   }, [stopTimer, stopStream]);
 
-  // Show preview blob in video element
+  // Mostrar preview en el video element
   useEffect(() => {
     if (state === "preview" && blobRef.current && videoRef.current) {
       const url = URL.createObjectURL(blobRef.current);
@@ -153,7 +226,7 @@ export default function ScreenRecorder({ onSendToCompressor, onRecordingChange }
     }
   }, [state]);
 
-  // Cleanup on unmount
+  // Cleanup al desmontar
   useEffect(() => {
     return () => {
       stopTimer();
@@ -193,7 +266,7 @@ export default function ScreenRecorder({ onSendToCompressor, onRecordingChange }
             <div>
               <p className="text-base font-medium text-text-primary">Graba tu pantalla</p>
               <p className="mt-1 text-sm text-text-secondary">
-                Sin audio · WebM · Directo al navegador
+                Sin audio · MP4 / WebM · Directo al navegador
               </p>
             </div>
           </div>
@@ -247,6 +320,17 @@ export default function ScreenRecorder({ onSendToCompressor, onRecordingChange }
         </div>
       )}
 
+      {/* Converting */}
+      {state === "converting" && (
+        <div className="flex flex-col items-center gap-4 py-10 text-center">
+          <svg className="h-8 w-8 animate-spin text-accent-light" viewBox="0 0 24 24" fill="none">
+            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+          </svg>
+          <p className="text-text-secondary">Convirtiendo a MP4...</p>
+        </div>
+      )}
+
       {/* Preview */}
       {state === "preview" && (
         <div className="flex flex-col gap-4">
@@ -256,28 +340,37 @@ export default function ScreenRecorder({ onSendToCompressor, onRecordingChange }
             className="w-full rounded-xl border border-border bg-black"
             style={{ maxHeight: "360px" }}
           />
+          {error && (
+            <div className="rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-3">
+              <p className="text-sm text-red-400">{error}</p>
+            </div>
+          )}
           <div className="flex flex-col gap-3 sm:flex-row">
             <button
               type="button"
-              onClick={handleDownload}
-              className="flex-1 rounded-lg bg-accent px-6 py-3 font-medium text-white transition-colors hover:bg-accent-hover"
+              onClick={handleDownloadMP4}
+              className="flex-1 rounded-lg bg-accent px-6 py-3 font-medium text-white transition-colors hover:bg-accent-hover disabled:opacity-60"
             >
-              Descargar ({sizeMB} MB)
+              {ffmpegReady
+                ? `Descargar MP4 (${sizeMB} MB)`
+                : "Descargar MP4 (preparando...)"}
             </button>
-            {needsCompression && (
-              <button
-                type="button"
-                onClick={handleSendToCompressor}
-                className="flex-1 rounded-lg border border-accent/50 px-6 py-3 text-sm font-medium text-accent-light transition-colors hover:bg-accent/10"
-              >
-                Comprimir primero
-              </button>
-            )}
+            <button
+              type="button"
+              onClick={handleDownloadWebM}
+              className="flex-1 rounded-lg border border-accent/50 px-6 py-3 text-sm font-medium text-accent-light transition-colors hover:bg-accent/10"
+            >
+              Descargar WebM ({sizeMB} MB)
+            </button>
           </div>
-          {!needsCompression && (
-            <p className="text-center text-xs text-text-muted">
-              El video pesa menos de 9 MB — no necesita compresión
-            </p>
+          {needsCompression && (
+            <button
+              type="button"
+              onClick={handleSendToCompressor}
+              className="w-full rounded-lg border border-border px-6 py-2.5 text-sm font-medium text-text-secondary transition-colors hover:bg-surface-hover"
+            >
+              Comprimir primero
+            </button>
           )}
           <button
             type="button"
